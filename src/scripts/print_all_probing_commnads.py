@@ -38,37 +38,15 @@ def main(args):
         split, tag = extract_tag(path)
         file_container[tag][split] = path
 
-    # Probing for not intervened results
-    for tag, file_dict in file_container.items():
-        if "edit" in tag:
-            continue
+    probing_train_2step_file = file_container["2step"]["probing_train"]
+    test_2step_file = file_container["2step"]["test"]
 
-        if file_dict["test"] is None or file_dict["probing_train"] is None:
-            print(f"Skipping {tag}")
-            continue
-
-        command = f"zsh ./scripts/probing.sh {file_dict['probing_train']} {file_dict['test']}"
-        print(command)
-        
-    probing_train_2step_result_file_path = file_container["2step"]["probing_train"]
-    if probing_train_2step_result_file_path is None:
-        print("# Skipping probing for intervened results")
+    if probing_train_2step_file is None or test_2step_file is None:
+        print("# Missing 2step probing outputs; run ./scripts/all_decode.sh first")
         return
-    probing_train_2step_model_dir_name = probing_train_2step_result_file_path.stem.replace("result_", "linear_classifier_model_")
-    probing_train_2step_model_dir = args.log_dir / probing_train_2step_model_dir_name
-    
-    print("")
-    # Probing for intervened results
-    for tag, file_dict in file_container.items():
-        if "edit" not in tag:
-            continue
-        
-        if file_dict["test"] is None:
-            print(f"Skipping {tag}")
-            continue
 
-        command = f"zsh ./scripts/probing_test.sh {probing_train_2step_model_dir} {file_dict['test']}"
-        print(command)
+    command = f"zsh ./scripts/probing.sh {probing_train_2step_file} {test_2step_file}"
+    print(command)
         
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
