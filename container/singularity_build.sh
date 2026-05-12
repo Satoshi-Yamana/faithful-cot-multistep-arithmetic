@@ -1,1 +1,1 @@
-singularity build --fakeroot dentaku_probing.sif singularity.def
+singularity build dentaku_probing.sif singularity.def
