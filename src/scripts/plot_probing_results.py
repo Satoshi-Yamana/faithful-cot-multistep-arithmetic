@@ -1,6 +1,8 @@
 """
-プロービング結果の可視化スクリプト
-JSONLファイルからヒートマップと折れ線グラフを生成
+プロービング結果の統合可視化スクリプト
+- タイトル指定
+- 変数ごとの色とシンボルの出し分け
+- 横軸のトークン表示と位置合わせ
 """
 import argparse
 import json
@@ -8,7 +10,7 @@ from pathlib import Path
 from collections import defaultdict
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 
 def load_probing_results(jsonl_path):
@@ -21,11 +23,7 @@ def load_probing_results(jsonl_path):
 
 
 def aggregate_scores(results):
-    """
-    結果を集計して、intermediate_answerごとに分類
-    各intermediate_answerについて層×位置のグリッドを作成
-    """
-    # intermediate_answer -> (layer, position) -> score
+    """結果を集計して、intermediate_answerごとに分類"""
     grid_data_by_answer = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
     position_max_scores_by_answer = defaultdict(lambda: defaultdict(float))
     tokens = {}  # position -> token
@@ -38,158 +36,172 @@ def aggregate_scores(results):
         token = record["token"]
         intermediate_answer = record["intermediate_answer"]
         
-        intermediate_answers.add(intermediate_answer)
-        tokens[position] = token
+        # 空白文字 'Ġ' や改行を見やすく置換
+        clean_token = token.replace('Ġ', ' ').replace('\n', '\\n')
         
-        # intermediate_answerごとに分類
+        intermediate_answers.add(intermediate_answer)
+        tokens[position] = clean_token
+        
         grid_data_by_answer[intermediate_answer][layer][position] = score
-        position_max_scores_by_answer[intermediate_answer][position] = score
+        position_max_scores_by_answer[intermediate_answer][position] = max(
+            position_max_scores_by_answer[intermediate_answer][position], score
+        )
     
     return grid_data_by_answer, position_max_scores_by_answer, tokens, intermediate_answers
 
 
-def create_visualization(results, output_path, title=None):
-    """
-    プロービング結果を可視化
-    intermediate_answerごとに異なる図を生成
-    各図：上段は折れ線グラフ、下段はヒートマップ
-    """
+def create_visualization_combined(results, output_path, title=None):
     grid_data_by_answer, position_max_scores_by_answer, tokens, intermediate_answers = aggregate_scores(results)
     
-    # intermediate_answerの名前マッピング
-    answer_names = {0: "Variable A", 1: "Variable B", 2: "Variable C"}
+    # ユーザー指定の順序: Z(1)が上, O(0)が下
+    sorted_answers = [1, 0]  # Zが上、Oが下の順序
     
-    # 各intermediate_answerごとに図を生成
-    for answer_idx in sorted(intermediate_answers):
+    # 設定：名前、色、マーカー、カラーマップの対応付け
+    answer_config = {
+        0: {"name": "Variable O", "color": "darkorange", "marker": "o", "cmap": "Oranges"},
+        1: {"name": "Variable Z", "color": "seagreen", "marker": "^", "cmap": "Greens"}
+    }
+
+    # 全データを通しての層と位置を取得
+    all_layers = set()
+    all_positions = set()
+    for ans in sorted_answers:
+        if ans in grid_data_by_answer:
+            all_layers.update(grid_data_by_answer[ans].keys())
+            for l in grid_data_by_answer[ans]:
+                all_positions.update(grid_data_by_answer[ans][l].keys())
+            
+    layers = sorted(list(all_layers))
+    positions = sorted(list(all_positions))
+    num_answers = len(sorted_answers)
+
+    # グラフ作成
+    height_ratios = [1.5] + [2.5] * num_answers
+    fig, axes = plt.subplots(num_answers + 1, 1, figsize=(14, 4 + 4 * num_answers), 
+                             gridspec_kw={'height_ratios': height_ratios})
+    
+    if not isinstance(axes, np.ndarray):
+        axes = [axes]
+
+    # 指定のタイトルを設定
+    fig_title = title or "Probing results for Qwen2.5-7B at the Level 3 task"
+    fig.suptitle(fig_title, fontsize=16, fontweight='bold', y=0.98)
+
+    # 共通のX軸設定
+    x_indices = np.arange(len(positions))
+    x_lim = [-0.5, len(positions) - 0.5]
+    x_labels = [f"{p}\n{tokens.get(p, '')}" for p in positions]
+
+    # ==========================================
+    # 1. 上段：折れ線グラフ (シンボルと色を分ける)
+    # ==========================================
+    ax_line = axes[0]
+    for answer_idx in sorted_answers:
+        if answer_idx not in position_max_scores_by_answer: continue
+        
+        max_scores = position_max_scores_by_answer[answer_idx]
+        line_scores = [max_scores.get(pos, np.nan) for pos in positions]
+        conf = answer_config.get(answer_idx)
+        
+        ax_line.plot(
+            x_indices, line_scores,
+            label=conf["name"],
+            marker=conf["marker"], # 異なるシンボル
+            linewidth=2, 
+            markersize=5, 
+            color=conf["color"],   # 揃えた色
+            alpha=0.9
+        )
+    
+    ax_line.set_xlim(x_lim)
+    ax_line.set_xticks(x_indices)
+    ax_line.tick_params(labelbottom=False) 
+    ax_line.set_ylabel('Max Accuracy', fontsize=11, fontweight='bold')
+    ax_line.set_ylim([0, 1.05])
+    ax_line.grid(True, linestyle='--', alpha=0.3)
+    ax_line.legend(loc='upper left', fontsize=10, frameon=True)
+
+    # ヒートマップと横幅を揃えるための透明なスペース
+    divider_line = make_axes_locatable(ax_line)
+    cax_dummy = divider_line.append_axes("right", size="3%", pad=0.1)
+    cax_dummy.axis('off')
+
+    # ==========================================
+    # 2. 下段以降：ヒートマップ (Zが上, Oが下)
+    # ==========================================
+    for i, answer_idx in enumerate(sorted_answers):
+        ax_heatmap = axes[i + 1]
+        conf = answer_config.get(answer_idx)
         grid_data = grid_data_by_answer[answer_idx]
-        position_max_scores = position_max_scores_by_answer[answer_idx]
+
+        heatmap_grid = np.zeros((len(layers), len(positions)))
+        for row_idx, layer in enumerate(layers):
+            for col_idx, pos in enumerate(positions):
+                heatmap_grid[row_idx, col_idx] = grid_data[layer].get(pos, 0.0)
+
+        im = ax_heatmap.imshow(
+            heatmap_grid,
+            aspect='auto',
+            cmap=conf["cmap"], # 各変数に合わせたカラーマップ
+            vmin=0.0,
+            vmax=1.0,
+            origin='lower'
+        )
+
+        ax_heatmap.set_xlim(x_lim)
+        ax_heatmap.set_xticks(x_indices)
         
-        # 層と位置を取得
-        layers = sorted(grid_data.keys())
-        if layers:
-            positions = sorted(set(
-                pos for layer_dict in grid_data.values() 
-                for pos in layer_dict.keys()
-            ))
+        # 最後の段にだけトークンラベルを表示
+        if i == num_answers - 1:
+            ax_heatmap.set_xticklabels(x_labels, rotation=0, ha='center', fontsize=8)
+            ax_heatmap.set_xlabel('Position (t) & Token', fontsize=11, fontweight='bold')
         else:
-            positions = []
-        
-        # ヒートマップ用グリッド作成
-        if layers and positions:
-            heatmap_grid = np.zeros((len(layers), len(positions)))
-            for i, layer in enumerate(layers):
-                for j, pos in enumerate(positions):
-                    heatmap_grid[i, j] = grid_data[layer].get(pos, 0.0)
-        else:
-            heatmap_grid = np.array([])
-        
-        # 折れ線グラフ用データ
-        line_positions = sorted(position_max_scores.keys())
-        line_scores = [position_max_scores[pos] for pos in line_positions]
-        
-        # 図作成
-        fig, axes = plt.subplots(2, 1, figsize=(14, 10))
-        answer_name = answer_names.get(answer_idx, f"Answer {answer_idx}")
-        fig_title = title or f"Probing Results - {answer_name}"
-        fig.suptitle(fig_title, fontsize=16, fontweight='bold')
-        
-        # 上段：折れ線グラフ
-        ax_line = axes[0]
-        ax_line.plot(line_positions, line_scores, marker='o', linewidth=2, markersize=4, color='purple')
-        ax_line.set_ylabel('Probing accuracy', fontsize=12, fontweight='bold')
-        ax_line.set_ylim([0, 1.0])
-        ax_line.grid(True, alpha=0.3)
-        ax_line.set_title(f'Max Probing Accuracy at Each Position ({answer_name})', fontsize=12)
-        
-        # 下段：ヒートマップ
-        ax_heatmap = axes[1]
-        if heatmap_grid.size > 0:
-            im = ax_heatmap.imshow(
-                heatmap_grid,
-                aspect='auto',
-                cmap='RdPu',
-                vmin=0.0,
-                vmax=1.0,
-                origin='upper'
-            )
-            
-            # x軸: 位置とトークン
-            ax_heatmap.set_xticks(range(len(positions)))
-            ax_heatmap.set_xticklabels([f"{p}" for p in positions], rotation=45, ha='right')
-            
-            # y軸: レイヤー
-            ax_heatmap.set_yticks(range(len(layers)))
-            ax_heatmap.set_yticklabels([f"Layer {l}" for l in layers])
-            
-            ax_heatmap.set_xlabel('Position (t)', fontsize=12, fontweight='bold')
-            ax_heatmap.set_ylabel('Layer (l)', fontsize=12, fontweight='bold')
-            ax_heatmap.set_title(f'Probing Accuracy Heatmap - {answer_name} (Layer × Position)', fontsize=12)
-            
-            # カラーバー
-            cbar = plt.colorbar(im, ax=ax_heatmap)
-            cbar.set_label('Accuracy', fontsize=11, fontweight='bold')
-            
-            # グリッド線
-            ax_heatmap.set_xticks(np.arange(len(positions)) - 0.5, minor=True)
-            ax_heatmap.set_yticks(np.arange(len(layers)) - 0.5, minor=True)
-            ax_heatmap.grid(which='minor', color='gray', linestyle='-', linewidth=0.5)
-        
-        plt.tight_layout()
-        
-        # 出力パスに答えのインデックスを挿入
-        output_file = output_path.parent / f"{output_path.stem}_answer_{answer_idx}{output_path.suffix}"
-        plt.savefig(output_file, dpi=150, bbox_inches='tight')
-        print(f"✓ {answer_name} の図を保存しました: {output_file}")
-        plt.close()
+            ax_heatmap.tick_params(labelbottom=False)
+
+        ax_heatmap.set_yticks(range(len(layers)))
+        ax_heatmap.set_yticklabels([f"L{l}" for l in layers], fontsize=8)
+        ax_heatmap.set_ylabel('Layer (l)', fontsize=11, fontweight='bold')
+        ax_heatmap.set_title(f'Probing Accuracy Heatmap: {conf["name"]}', fontsize=12, color=conf["color"], fontweight='bold')
+
+        # カラーバー
+        divider_heatmap = make_axes_locatable(ax_heatmap)
+        cax_heatmap = divider_heatmap.append_axes("right", size="3%", pad=0.1)
+        cbar = plt.colorbar(im, cax=cax_heatmap)
+        cbar.ax.tick_params(labelsize=8)
+
+        # グリッド
+        ax_heatmap.set_xticks(np.arange(len(positions)) - 0.5, minor=True)
+        ax_heatmap.set_yticks(np.arange(len(layers)) - 0.5, minor=True)
+        ax_heatmap.grid(which='minor', color='white', linestyle='-', linewidth=0.5, alpha=0.3)
+
+    plt.tight_layout()
+    fig.subplots_adjust(hspace=0.35)
+
+    output_file = output_path.parent / f"final_probing_visualization.png"
+    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    print(f"✓ 可視化を保存しました: {output_file}")
+    plt.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="プロービング結果をJSONLから可視化"
-    )
-    parser.add_argument(
-        "input_jsonl",
-        type=str,
-        help="入力JSONLファイルパス (e.g., linear_classifier_result_*.jsonl)"
-    )
-    parser.add_argument(
-        "-o", "--output",
-        type=str,
-        default=None,
-        help="出力画像パス (デフォルト: 入力ファイル名から.pngに変更)"
-    )
-    parser.add_argument(
-        "--title",
-        type=str,
-        default=None,
-        help="グラフのタイトル"
-    )
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input_jsonl", type=str)
     args = parser.parse_args()
     
     input_path = Path(args.input_jsonl)
     if not input_path.exists():
-        print(f"✗ ファイルが見つかりません: {input_path}")
+        print(f"✗ ファイルがありません: {input_path}")
         return
     
-    # 出力パスを決定
-    if args.output is None:
-        # デフォルトは result_probing ディレクトリに保存
-        result_probing_dir = Path("result_probing")
-        result_probing_dir.mkdir(exist_ok=True, parents=True)
-        output_path = result_probing_dir / f"{input_path.stem}.png"
-    else:
-        output_path = Path(args.output)
-    
-    print(f"📖 読み込み中: {input_path}")
+    print(f"📖 処理中: {input_path.name}")
     results = load_probing_results(input_path)
-    print(f"   {len(results)} 件のレコードを読み込みました")
     
-    title = args.title or f"Probing Results ({input_path.stem})"
-    
-    print(f"🎨 可視化を生成中...")
-    create_visualization(results, output_path, title=title)
-
+    # 指示通りのタイトルを渡す
+    create_visualization_combined(
+        results, 
+        input_path, 
+        title="Probing results for Qwen2.5-7B at the Level 3 task"
+    )
 
 if __name__ == "__main__":
     main()
